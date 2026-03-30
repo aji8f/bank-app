@@ -13,8 +13,6 @@ use Illuminate\Support\Facades\Validator;
 class AccountController extends Controller
 {
     /**
-     * Get the balance for a specific user.
-     *
      * GET /balance/{user_id}
      */
     public function balance(int $user_id): JsonResponse
@@ -30,49 +28,49 @@ class AccountController extends Controller
             'name'    => $user->name,
             'email'   => $user->email,
             'balance' => (float) $user->balance,
-        ])->withHeaders($this->rateLimitHeaders());
+        ])->withHeaders($this->securityHeaders());
     }
 
     /**
-     * Deposit money into a user's account.
-     *
      * POST /deposit
      * Body: { "user_id": 1, "amount": 50000 }
      */
     public function deposit(Request $request): JsonResponse
     {
         $validator = Validator::make($request->all(), [
-            'user_id' => 'required|integer|min:1',
+            'user_id' => 'required|integer|min:1|exists:users,id',
             'amount'  => 'required|numeric|min:0.01',
+        ], [
+            'user_id.exists' => 'User not found.',
+            'amount.min'     => 'Amount must be greater than 0.',
         ]);
 
         if ($validator->fails()) {
-            $errors = $validator->errors()->all();
-            $isAmountError = collect($errors)->contains(fn($e) => str_contains(strtolower($e), 'amount'));
+            $errors = $validator->errors();
 
-            if ($isAmountError) {
+            if ($errors->has('user_id') && str_contains($errors->first('user_id'), 'not found')) {
+                throw BankingException::userNotFound();
+            }
+
+            if ($errors->has('amount')) {
                 throw BankingException::invalidAmount();
             }
 
             return response()->json([
-                'error'   => implode(', ', $errors),
-                'code'    => 'VALIDATION_ERROR',
+                'error'  => $errors->first(),
+                'code'   => 'VALIDATION_ERROR',
+                'errors' => $errors->all(),
             ], 422);
         }
 
         $userId = (int) $request->input('user_id');
         $amount = (float) $request->input('amount');
 
-        if ($amount <= 0) {
-            throw BankingException::invalidAmount();
-        }
+        $user        = null;
+        $transaction = DB::transaction(function () use ($userId, $amount, &$user) {
+            // Lock row for concurrent deposit safety
+            $user = User::lockForUpdate()->find($userId);
 
-        $user = User::find($userId);
-        if (!$user) {
-            throw BankingException::userNotFound();
-        }
-
-        $transaction = DB::transaction(function () use ($user, $amount) {
             $user->increment('balance', $amount);
             $user->refresh();
 
@@ -82,7 +80,7 @@ class AccountController extends Controller
                 'type'         => 'deposit',
                 'amount'       => $amount,
                 'status'       => 'success',
-                'note'         => "Deposit of {$amount} to user {$user->id}",
+                'note'         => "Deposit Rp " . number_format($amount, 0, ',', '.') . " ke akun {$user->name}",
             ]);
         });
 
@@ -90,14 +88,14 @@ class AccountController extends Controller
             'message'        => 'Deposit successful',
             'transaction_id' => $transaction->id,
             'user_id'        => $user->id,
+            'name'           => $user->name,
             'amount'         => $amount,
-            'new_balance'    => (float) $user->balance,
-        ], 201)->withHeaders($this->rateLimitHeaders());
+            'balance'        => (float) $user->balance,   // key yg dipakai frontend
+            'new_balance'    => (float) $user->balance,   // alias
+        ], 201)->withHeaders($this->securityHeaders());
     }
 
     /**
-     * List all users (for testing purposes).
-     *
      * GET /users
      */
     public function users(): JsonResponse
@@ -105,30 +103,43 @@ class AccountController extends Controller
         $users = User::select('id', 'name', 'email', 'balance', 'created_at')
             ->orderBy('id')
             ->get()
-            ->map(function ($user) {
-                return [
-                    'id'         => $user->id,
-                    'name'       => $user->name,
-                    'email'      => $user->email,
-                    'balance'    => (float) $user->balance,
-                    'created_at' => $user->created_at,
-                ];
-            });
+            ->map(fn($u) => [
+                'id'         => $u->id,
+                'name'       => $u->name,
+                'email'      => $u->email,
+                'balance'    => (float) $u->balance,
+                'created_at' => $u->created_at,
+            ]);
 
         return response()->json([
-            'data'  => $users,
+            'users' => $users,           // diperbaiki: dari 'data' → 'users'
             'total' => $users->count(),
-        ])->withHeaders($this->rateLimitHeaders());
+        ])->withHeaders($this->securityHeaders());
     }
 
     /**
-     * Return common rate limiting headers.
+     * GET /stats — agregat untuk dashboard
      */
-    private function rateLimitHeaders(): array
+    public function stats(): JsonResponse
+    {
+        $totalUsers   = User::count();
+        $totalBalance = (float) User::sum('balance');
+        $totalTx      = Transaction::count();
+        $successTx    = Transaction::where('status', 'success')->count();
+
+        return response()->json([
+            'total_users'         => $totalUsers,
+            'total_balance'       => $totalBalance,
+            'total_transactions'  => $totalTx,
+            'success_transactions'=> $successTx,
+        ])->withHeaders($this->securityHeaders());
+    }
+
+    private function securityHeaders(): array
     {
         return [
-            'X-RateLimit-Limit'     => '100',
-            'X-RateLimit-Remaining' => '99',
+            'X-RateLimit-Limit'      => '100',
+            'X-RateLimit-Remaining'  => '99',
             'X-Content-Type-Options' => 'nosniff',
             'X-Frame-Options'        => 'DENY',
         ];

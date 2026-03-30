@@ -26,6 +26,8 @@ Route::post('/deposit', [AccountController::class, 'deposit']);
 
 Route::get('/users', [AccountController::class, 'users']);
 
+Route::get('/stats', [AccountController::class, 'stats']);
+
 // Transaction endpoints
 Route::post('/transfer', [TransactionController::class, 'transfer']);
 

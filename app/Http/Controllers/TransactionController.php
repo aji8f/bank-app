@@ -13,30 +13,42 @@ use Illuminate\Support\Facades\Validator;
 class TransactionController extends Controller
 {
     /**
-     * Transfer funds between two users.
-     *
      * POST /transfer
      * Body: { "from": 1, "to": 2, "amount": 10000 }
      */
     public function transfer(Request $request): JsonResponse
     {
         $validator = Validator::make($request->all(), [
-            'from'   => 'required|integer|min:1',
-            'to'     => 'required|integer|min:1',
+            'from'   => 'required|integer|min:1|exists:users,id',
+            'to'     => 'required|integer|min:1|exists:users,id|different:from',
             'amount' => 'required|numeric|min:0.01',
+        ], [
+            'from.exists'    => 'Sender user not found.',
+            'to.exists'      => 'Receiver user not found.',
+            'to.different'   => 'Cannot transfer to the same account.',
+            'amount.min'     => 'Amount must be greater than 0.',
         ]);
 
         if ($validator->fails()) {
-            $errors = $validator->errors()->all();
-            $isAmountError = collect($errors)->contains(fn($e) => str_contains(strtolower($e), 'amount'));
+            $errors = $validator->errors();
 
-            if ($isAmountError) {
+            if ($errors->has('from') || $errors->has('to')) {
+                if (str_contains($errors->first('from') . $errors->first('to'), 'not found')) {
+                    throw BankingException::userNotFound();
+                }
+                if ($errors->has('to') && str_contains($errors->first('to'), 'same')) {
+                    throw BankingException::sameUser();
+                }
+            }
+
+            if ($errors->has('amount')) {
                 throw BankingException::invalidAmount();
             }
 
             return response()->json([
-                'error' => implode(', ', $errors),
-                'code'  => 'VALIDATION_ERROR',
+                'error'  => $errors->first(),
+                'code'   => 'VALIDATION_ERROR',
+                'errors' => $errors->all(),
             ], 422);
         }
 
@@ -44,35 +56,22 @@ class TransactionController extends Controller
         $toId   = (int) $request->input('to');
         $amount = (float) $request->input('amount');
 
-        if ($amount <= 0) {
-            throw BankingException::invalidAmount();
-        }
-
-        if ($fromId === $toId) {
-            throw BankingException::sameUser();
-        }
-
-        $sender   = User::find($fromId);
-        $receiver = User::find($toId);
-
-        if (!$sender) {
-            throw BankingException::userNotFound();
-        }
-
-        if (!$receiver) {
-            throw BankingException::userNotFound();
-        }
-
+        // Pre-check balance (fast fail before acquiring DB lock)
+        $sender = User::find($fromId);
         if ((float) $sender->balance < $amount) {
             throw BankingException::insufficientBalance();
         }
 
-        $transaction = DB::transaction(function () use ($sender, $receiver, $amount) {
-            // Lock both rows to prevent race conditions
-            $sender   = User::lockForUpdate()->find($sender->id);
-            $receiver = User::lockForUpdate()->find($receiver->id);
+        $receiver    = null;
+        $transaction = DB::transaction(function () use ($fromId, $toId, $amount, &$sender, &$receiver) {
+            // Lock both rows in consistent order (low id first) to avoid deadlock
+            $ids = [$fromId, $toId];
+            sort($ids);
 
-            // Re-check balance after lock
+            $locked = User::lockForUpdate()->whereIn('id', $ids)->get()->keyBy('id');
+            $sender   = $locked[$fromId];
+            $receiver = $locked[$toId];
+
             if ((float) $sender->balance < $amount) {
                 throw BankingException::insufficientBalance();
             }
@@ -86,7 +85,7 @@ class TransactionController extends Controller
                 'type'         => 'transfer',
                 'amount'       => $amount,
                 'status'       => 'success',
-                'note'         => "Transfer of {$amount} from user {$sender->id} to user {$receiver->id}",
+                'note'         => "Transfer Rp " . number_format($amount, 0, ',', '.') . " dari {$sender->name} ke {$receiver->name}",
             ]);
         });
 
@@ -94,26 +93,28 @@ class TransactionController extends Controller
         $receiver->refresh();
 
         return response()->json([
-            'message'          => 'Transfer successful',
-            'transaction_id'   => $transaction->id,
-            'from'             => [
+            'message'        => 'Transfer successful',
+            'transaction_id' => $transaction->id,
+            'amount'         => $amount,
+            'timestamp'      => now()->toIso8601String(),
+            // flat keys untuk frontend
+            'from_balance'   => (float) $sender->balance,
+            'to_balance'     => (float) $receiver->balance,
+            // detail lengkap
+            'from' => [
                 'user_id'     => $sender->id,
                 'name'        => $sender->name,
                 'new_balance' => (float) $sender->balance,
             ],
-            'to'               => [
+            'to' => [
                 'user_id'     => $receiver->id,
                 'name'        => $receiver->name,
                 'new_balance' => (float) $receiver->balance,
             ],
-            'amount'           => $amount,
-            'timestamp'        => now()->toIso8601String(),
-        ], 200)->withHeaders($this->rateLimitHeaders());
+        ], 200)->withHeaders($this->securityHeaders());
     }
 
     /**
-     * Get transaction history for a specific user.
-     *
      * GET /transactions/{user_id}
      */
     public function history(int $user_id): JsonResponse
@@ -131,38 +132,35 @@ class TransactionController extends Controller
             ->get()
             ->map(function ($tx) use ($user_id) {
                 return [
-                    'id'           => $tx->id,
-                    'type'         => $tx->type,
-                    'amount'       => (float) $tx->amount,
-                    'status'       => $tx->status,
-                    'direction'    => $tx->from_user_id === $user_id ? 'debit' : 'credit',
-                    'from_user'    => $tx->fromUser ? [
+                    'id'         => $tx->id,
+                    'type'       => $tx->type,
+                    'amount'     => (float) $tx->amount,
+                    'status'     => $tx->status,
+                    'direction'  => ((int) $tx->from_user_id === (int) $user_id) ? 'debit' : 'credit',
+                    'from_user'  => $tx->fromUser ? [
                         'id'    => $tx->fromUser->id,
                         'name'  => $tx->fromUser->name,
                         'email' => $tx->fromUser->email,
                     ] : null,
-                    'to_user'      => $tx->toUser ? [
+                    'to_user'    => $tx->toUser ? [
                         'id'    => $tx->toUser->id,
                         'name'  => $tx->toUser->name,
                         'email' => $tx->toUser->email,
                     ] : null,
-                    'note'         => $tx->note,
-                    'created_at'   => $tx->created_at,
+                    'note'       => $tx->note,
+                    'created_at' => $tx->created_at,
                 ];
             });
 
         return response()->json([
-            'user_id' => $user_id,
-            'name'    => $user->name,
-            'data'    => $transactions,
-            'total'   => $transactions->count(),
-        ])->withHeaders($this->rateLimitHeaders());
+            'user_id'      => $user_id,
+            'name'         => $user->name,
+            'transactions' => $transactions,   // diperbaiki: dari 'data' → 'transactions'
+            'total'        => $transactions->count(),
+        ])->withHeaders($this->securityHeaders());
     }
 
-    /**
-     * Return common rate limiting headers.
-     */
-    private function rateLimitHeaders(): array
+    private function securityHeaders(): array
     {
         return [
             'X-RateLimit-Limit'      => '100',
