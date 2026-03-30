@@ -12,8 +12,7 @@ return Application::configure(basePath: dirname(__DIR__))
         health: '/up',
     )
     ->withMiddleware(function (Middleware $middleware): void {
-        // API middleware - stateless, no CSRF
-        $middleware->statefulApi();
+        // Stateless API - no Sanctum, no CSRF
     })
     ->withExceptions(function (Exceptions $exceptions): void {
         // Ensure all exceptions return JSON for API routes
